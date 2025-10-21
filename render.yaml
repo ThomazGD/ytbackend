@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: yt-backend
+    env: docker
+    plan: free  # ou 'starter' para mais recursos
+    region: sfo  # ou outra região mais próxima de você
+    buildCommand: ""
+    startCommand: ""
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: FILES_DIR
+        value: "/app/files"
+    numInstances: 1
+    healthCheckPath: /docs
+    autoDeploy: true
+
+    # Se precisar de armazenamento persistente (para arquivos baixados)
+    # volumes:
+    #   - name: media
+    #     mountPath: /app/files
+    #     sizeGB: 1  # Ajuste conforme necessário
