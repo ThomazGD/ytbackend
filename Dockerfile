@@ -1,35 +1,26 @@
-# ==== build/run base ====
 FROM python:3.11-slim
 
-# Evita buffering no log
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
-
-# Pasta de trabalho
-WORKDIR /app
-
-# System deps (FFmpeg, etc.)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    ca-certificates \
+# Instala FFmpeg e dependências do sistema
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copia e instala deps Python
+# Configuração do ambiente
+WORKDIR /app
+ENV PORT=8080
+ENV FILES_DIR=/app/files
+
+# Copia e instala dependências
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia código
+# Copia o código
 COPY . .
 
-# Exponha a porta do Uvicorn
-EXPOSE 8000
-
-# Variável para apontar pasta de arquivos (ajuda a persistir via volume)
-ENV FILES_DIR=/app/files
-
-# Cria diretório de arquivos
+# Cria diretório para arquivos
 RUN mkdir -p ${FILES_DIR}
 
+# Expõe a porta
+EXPOSE 8080
+
 # Comando de inicialização
-# (Use workers=1: yt-dlp/FFmpeg consomem CPU; escale réplicas se precisar)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

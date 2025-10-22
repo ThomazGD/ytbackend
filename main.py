@@ -44,42 +44,57 @@ class StatusRes(BaseModel):
     file_url: Optional[str] = None
     filename: Optional[str] = None
 
-def build_ydl_opts(job_id: str, fmt: str):
+def build_ydl_opts(job_id: str, fmt: str, allow_missing_pot: bool = False):
     outtmpl = os.path.join(FILES_DIR, f"{job_id}.%(ext)s")
 
-    # Caminho do FFmpeg local
-    ffmpeg_path = os.path.join(BASE_DIR, "ffmpeg", "bin")
-
-    # Pós-processamento conforme formato
-    postprocessors = []
-    merge_output_format = None
-    format_sel = "bestaudio/best"
-
+    # Seletores tolerantes
     if fmt == "mp3":
-        format_sel = "bestaudio/best"
-        postprocessors = [{
+        format_sel = (
+            "bestaudio[ext=m4a]/"
+            "bestaudio[acodec^=mp4a]/"
+            "bestaudio/best"
+        )
+        post = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
             "preferredquality": "0",
         }]
-        merge_output_format = None
-    else:  # mp4
-        format_sel = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        postprocessors = []
-        merge_output_format = "mp4"
+        merge_out = None
+    elif fmt == "mp4":
+        format_sel = (
+            "bv*[ext=mp4]+ba[ext=m4a]/"
+            "bv*+ba/best[ext=mp4]/best"
+        )
+        post = []
+        merge_out = "mp4"
+    else:
+        format_sel = "best"
+        post, merge_out = [], None
+
+    # Sempre use cliente WEB para evitar PO token
+    extractor_args = {"youtube": {"player_client": ["web"]}}
+    if allow_missing_pot:
+        # Aceita formatos marcados como dependentes de PO token
+        extractor_args["youtube"]["formats"] = ["missing_pot"]
 
     ydl_opts = {
         "format": format_sel,
         "outtmpl": outtmpl,
         "quiet": True,
+        "no_warnings": True,
         "noprogress": True,
+        "retries": 10,
+        "fragment_retries": 10,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "concurrent_fragment_downloads": 1,
         "nocheckcertificate": True,
-        "merge_output_format": merge_output_format,
-        "postprocessors": postprocessors,
-
-        # Configuração do FFmpeg local
-        "ffmpeg_location": ffmpeg_path,
-
+        "prefer_ffmpeg": True,
+        "merge_output_format": merge_out,
+        "postprocessors": post,
+        "extractor_args": extractor_args,
+        # Ajuda em casos de "sem formato"
+        "ignore_no_formats_error": True,
+        
         # Configurações de segurança e desempenho
         "cookiefile": os.path.join(BASE_DIR, "cookies.txt"),
         "http_headers": {
@@ -91,15 +106,15 @@ def build_ydl_opts(job_id: str, fmt: str):
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
             "Referer": "https://www.youtube.com/",
         },
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web"],
-            }
-        },
         "noplaylist": True,
         "geo_bypass": True,
-        "progress_hooks": [],
     }
+    
+    # Adiciona FFmpeg local se existir
+    ffmpeg_path = os.path.join(BASE_DIR, "ffmpeg", "bin")
+    if os.path.exists(ffmpeg_path):
+        ydl_opts["ffmpeg_location"] = ffmpeg_path
+        
     return ydl_opts
 
 async def run_download(job_id: str, url: str, fmt: str):
@@ -120,40 +135,67 @@ async def run_download(job_id: str, url: str, fmt: str):
         elif d.get("status") == "finished":
             job["message"] = "Processando…"
 
-    ydl_opts = build_ydl_opts(job_id, fmt)
-    ydl_opts["progress_hooks"] = [_hook]
+    def _run_once(opts):
+        with YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=True)
 
     try:
         loop = asyncio.get_running_loop()
-        def _run():
-            with YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                return info
+        ydl_opts = build_ydl_opts(job_id, fmt, allow_missing_pot=False)
+        ydl_opts["progress_hooks"] = [_hook]
 
-        info = await loop.run_in_executor(None, _run)
-        
-        # Descobrir o arquivo final (mp3/mp4) do job
-        import glob
+        # Primeira tentativa
+        info = await loop.run_in_executor(None, lambda: _run_once(ydl_opts))
+
+        # Sucesso na primeira tentativa
         ext = "mp3" if fmt == "mp3" else "mp4"
-        pattern = os.path.join(FILES_DIR, f"{job_id}*.{ext}")
-        candidates = glob.glob(pattern)
-        
-        if not candidates:
-            raise RuntimeError("Arquivo final não encontrado (verifique ffmpeg e pós-processamento).")
-            
-        final_path = max(candidates, key=os.path.getmtime)
-        filename = os.path.basename(final_path)
+        filename = f"{job_id}.{ext}"
+        final_path = os.path.join(FILES_DIR, filename)
 
         job["status"] = "done"
         job["progress"] = 100.0
         job["filename"] = filename
         job["file_url"] = f"/files/{filename}"
         job["message"] = "Concluído"
+
     except Exception as e:
-        import traceback
-        job["status"] = "error"
-        job["message"] = f"{e.__class__.__name__}: {e}"
-        print("YT-DLP ERROR:", traceback.format_exc())
+        msg = str(e)
+        # Retry com allow_missing_pot quando o erro é de formato indisponível
+        if "Requested format is not available" in msg or "Only images are available" in msg:
+            job["message"] = "Re-tentando com fallback de formatos…"
+            try:
+                # Segunda tentativa com fallback
+                ydl_opts = build_ydl_opts(job_id, fmt, allow_missing_pot=True)
+                ydl_opts["progress_hooks"] = [_hook]
+                
+                info = await loop.run_in_executor(
+                    None,
+                    lambda: _run_once(ydl_opts)
+                )
+                
+                ext = "mp3" if fmt == "mp3" else "mp4"
+                filename = f"{job_id}.{ext}"
+                final_path = os.path.join(FILES_DIR, filename)
+
+                job["status"] = "done"
+                job["progress"] = 100.0
+                job["filename"] = filename
+                job["file_url"] = f"/files/{filename}"
+                job["message"] = "Concluído (fallback)"
+                
+            except Exception as ee:
+                job["status"] = "error"
+                job["message"] = f"Falha (formatos indisponíveis): {ee}"
+                print(f"YT-DLP FALLBACK ERROR: {ee}")
+        else:
+            job["status"] = "error"
+            job["message"] = f"Erro ao baixar: {msg}"
+            print(f"YT-DLP ERROR: {msg}")
+            
+        # Log detalhado em caso de erro
+        if job["status"] == "error":
+            import traceback
+            print("YT-DLP TRACEBACK:", traceback.format_exc())
 
 @app.post("/api/download", response_model=StatusRes)
 async def create_download(req: DownloadReq, bg: BackgroundTasks):
